@@ -298,6 +298,67 @@ textarea.short{min-height:80px}
       async remove(name,id){const d=read();d[name]=d[name].filter(x=>x.id!==id);try{localStorage.setItem(LOCAL_KEY,JSON.stringify(d));}catch(e){}cbs[name]&&cbs[name](d[name]);}
     };
   }
+  // IndexedDB: much larger than localStorage; covers are stored as image files (Blob)
+  function idbStore(){
+    return new Promise(resolve=>{
+      if(!window.indexedDB){resolve(null);return;}
+      let req;try{req=indexedDB.open('reading-log',1);}catch(e){resolve(null);return;}
+      const NAMES=['books','entries','quotes'];
+      req.onupgradeneeded=()=>{const db=req.result;NAMES.forEach(n=>{if(!db.objectStoreNames.contains(n))db.createObjectStore(n,{keyPath:'id'});});};
+      req.onerror=()=>resolve(null);
+      req.onblocked=()=>resolve(null);
+      req.onsuccess=async()=>{
+        const db=req.result;
+        const p=r=>new Promise((res,rej)=>{r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});
+        const tx=(names,mode)=>db.transaction(names,mode);
+        const done=t=>new Promise((res,rej)=>{t.oncomplete=()=>res();t.onerror=()=>rej(t.error);t.onabort=()=>rej(t.error||new Error('abort'));});
+        const urlCache=new Map();   // bookId -> {rev,url}
+        const byUrl=new Map();      // object URL -> {blob,rev}
+        const toBlob=d=>{const i=d.indexOf(',');const mime=(d.slice(0,i).match(/data:([^;,]+)/)||[])[1]||'image/jpeg';
+          const bin=atob(d.slice(i+1));const u=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);return new Blob([u],{type:mime});};
+        const toRecord=(name,id,data)=>{const r={id,...data};
+          if(name==='books'){const c=r.cover||'';delete r.cover;delete r.coverBlob;delete r.coverRev;
+            if(c.startsWith('data:')){r.coverBlob=toBlob(c);r.coverRev=Date.now()+'-'+Math.random().toString(36).slice(2,6);}
+            else if(c.startsWith('blob:')&&byUrl.has(c)){const m=byUrl.get(c);r.coverBlob=m.blob;r.coverRev=m.rev;}}
+          return r;};
+        const fromRecord=(name,r)=>{
+          if(name!=='books')return r;
+          const o={...r};delete o.coverBlob;delete o.coverRev;o.cover='';
+          const old=urlCache.get(r.id);
+          if(r.coverBlob instanceof Blob){
+            const rev=r.coverRev||'0';
+            if(old&&old.rev===rev){o.cover=old.url;}
+            else{if(old){URL.revokeObjectURL(old.url);byUrl.delete(old.url);}
+              const url=URL.createObjectURL(r.coverBlob);urlCache.set(r.id,{rev,url});byUrl.set(url,{blob:r.coverBlob,rev});o.cover=url;}
+          }else if(old){URL.revokeObjectURL(old.url);byUrl.delete(old.url);urlCache.delete(r.id);}
+          return o;};
+        const cbs={};
+        const load=async name=>{const all=await p(tx(name,'readonly').objectStore(name).getAll());cbs[name]&&cbs[name](all.map(r=>fromRecord(name,r)));};
+
+        // move data from the old localStorage version, once
+        try{
+          const counts=await Promise.all(NAMES.map(n=>p(tx(n,'readonly').objectStore(n).count())));
+          const raw=localStorage.getItem(LOCAL_KEY),oldRaw=localStorage.getItem(OLD_LOCAL_KEY);
+          if(counts.every(c=>c===0)&&(raw||oldRaw)){
+            const d=raw?JSON.parse(raw):{books:[],entries:JSON.parse(oldRaw||'[]'),quotes:[]};
+            const t=tx(NAMES,'readwrite');
+            NAMES.forEach(n=>(d[n]||[]).forEach(x=>{if(x&&x.id)t.objectStore(n).put(toRecord(n,x.id,strip(x)));}));
+            await done(t);
+            localStorage.removeItem(LOCAL_KEY);localStorage.removeItem(OLD_LOCAL_KEY);
+          }
+        }catch(e){}
+        // ask the browser not to clear this data when space runs low
+        try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist();}catch(e){}
+
+        resolve({mode:'idb',
+          subscribe(name,fn){cbs[name]=fn;load(name).catch(()=>fn([]));},
+          async save(name,id,data){const t=tx(name,'readwrite');t.objectStore(name).put(toRecord(name,id,data));await done(t);await load(name);},
+          async remove(name,id){const t=tx(name,'readwrite');t.objectStore(name).delete(id);await done(t);await load(name);}
+        });
+      };
+    });
+  }
+
   async function dbStore(){
     if(!window.claude||typeof window.claude.use!=='function')return null;
     try{
@@ -578,7 +639,7 @@ textarea.short{min-height:80px}
         if(b&&b.title!==title){for(const e of entriesOf(id)){await store.save('entries',e.id,{...strip(e),book:title});}}
         pendingCover=null;shelfTab=status;try{localStorage.setItem('rl-tab',status);}catch(e){}
         toast(b?'บันทึกการแก้ไขแล้ว':'เพิ่มหนังสือแล้ว');go('#/book/'+id);
-      }catch(x){$('hint').textContent=store.mode==='local'?'บันทึกไม่สำเร็จ พื้นที่ในเบราว์เซอร์อาจเต็ม ลองเอารูปปกออก':'บันทึกไม่สำเร็จ ลองอีกครั้ง';$('save').disabled=false;}
+      }catch(x){$('hint').textContent=store.mode!=='db'?'บันทึกไม่สำเร็จ พื้นที่ในเบราว์เซอร์อาจเต็ม ลองเอารูปปกออก':'บันทึกไม่สำเร็จ ลองอีกครั้ง';$('save').disabled=false;}
     };
     if(b){
       const del=el('button','link danger','ลบเล่มนี้และบันทึกทั้งหมดของเล่มนี้');del.type='button';del.style.marginTop='6px';
@@ -699,7 +760,9 @@ textarea.short{min-height:80px}
   // ---------- start ----------
   (async()=>{
     store=await dbStore();
-    if(!store){store=localStore();const n=$('notice');n.hidden=false;n.textContent='บันทึกจะเก็บไว้ในเบราว์เซอร์นี้เท่านั้น ถ้าล้างข้อมูลเบราว์เซอร์ บันทึกจะหายไป';}
+    if(!store)store=await idbStore();
+    if(!store)store=localStore();
+    if(store.mode!=='db'){const n=$('notice');n.hidden=false;n.textContent='บันทึกจะเก็บไว้ในเบราว์เซอร์นี้เท่านั้น ถ้าล้างข้อมูลเบราว์เซอร์ บันทึกจะหายไป';}
     const onErr=()=>toast('การเชื่อมต่อขาดหาย ลองโหลดหน้าใหม่');
     const onData=(name,list)=>{
       if(name==='books')books=list.filter(b=>b&&b.title);else if(name==='quotes')quotes=list.filter(q=>q&&q.text&&q.bookId);else entries=list.filter(e=>e&&e.date&&e.note);
