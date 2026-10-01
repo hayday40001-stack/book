@@ -294,7 +294,7 @@ textarea.short{min-height:80px}
     return{mode:'local',
       subscribe(name,fn){cbs[name]=fn;fn(read()[name]);},
       async save(name,id,data){const d=read();d[name]=d[name].filter(x=>x.id!==id);d[name].push({id,...data});
-        try{localStorage.setItem(LOCAL_KEY,JSON.stringify(d));}catch(e){throw new Error('full');}cbs[name]&&cbs[name](d[name]);},
+        localStorage.setItem(LOCAL_KEY,JSON.stringify(d));cbs[name]&&cbs[name](d[name]);},
       async remove(name,id){const d=read();d[name]=d[name].filter(x=>x.id!==id);try{localStorage.setItem(LOCAL_KEY,JSON.stringify(d));}catch(e){}cbs[name]&&cbs[name](d[name]);}
     };
   }
@@ -314,22 +314,24 @@ textarea.short{min-height:80px}
         const done=t=>new Promise((res,rej)=>{t.oncomplete=()=>res();t.onerror=()=>rej(t.error);t.onabort=()=>rej(t.error||new Error('abort'));});
         const urlCache=new Map();   // bookId -> {rev,url}
         const byUrl=new Map();      // object URL -> {blob,rev}
-        const toBlob=d=>{const i=d.indexOf(',');const mime=(d.slice(0,i).match(/data:([^;,]+)/)||[])[1]||'image/jpeg';
-          const bin=atob(d.slice(i+1));const u=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);return new Blob([u],{type:mime});};
+        const toBuf=d=>{const i=d.indexOf(',');const mime=(d.slice(0,i).match(/data:([^;,]+)/)||[])[1]||'image/jpeg';
+          const bin=atob(d.slice(i+1));const u=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);return{buf:u.buffer,type:mime};};
         const toRecord=(name,id,data)=>{const r={id,...data};
-          if(name==='books'){const c=r.cover||'';delete r.cover;delete r.coverBlob;delete r.coverRev;
-            if(c.startsWith('data:')){r.coverBlob=toBlob(c);r.coverRev=Date.now()+'-'+Math.random().toString(36).slice(2,6);}
-            else if(c.startsWith('blob:')&&byUrl.has(c)){const m=byUrl.get(c);r.coverBlob=m.blob;r.coverRev=m.rev;}}
+          if(name==='books'){const c=r.cover||'';delete r.cover;delete r.coverBlob;delete r.coverBuf;delete r.coverType;delete r.coverRev;
+            if(c.startsWith('data:')){const x=toBuf(c);r.coverBuf=x.buf;r.coverType=x.type;r.coverRev=Date.now()+'-'+Math.random().toString(36).slice(2,6);}
+            else if(c.startsWith('blob:')&&byUrl.has(c)){const m=byUrl.get(c);if(m.buf){r.coverBuf=m.buf;r.coverType=m.type;}else r.coverBlob=m.blob;r.coverRev=m.rev;}}
           return r;};
         const fromRecord=(name,r)=>{
           if(name!=='books')return r;
-          const o={...r};delete o.coverBlob;delete o.coverRev;o.cover='';
+          const o={...r};delete o.coverBlob;delete o.coverBuf;delete o.coverType;delete o.coverRev;o.cover='';
           const old=urlCache.get(r.id);
-          if(r.coverBlob instanceof Blob){
+          const hasBuf=r.coverBuf instanceof ArrayBuffer,hasBlob=r.coverBlob instanceof Blob;
+          if(hasBuf||hasBlob){
             const rev=r.coverRev||'0';
             if(old&&old.rev===rev){o.cover=old.url;}
             else{if(old){URL.revokeObjectURL(old.url);byUrl.delete(old.url);}
-              const url=URL.createObjectURL(r.coverBlob);urlCache.set(r.id,{rev,url});byUrl.set(url,{blob:r.coverBlob,rev});o.cover=url;}
+              const blob=hasBuf?new Blob([r.coverBuf],{type:r.coverType||'image/jpeg'}):r.coverBlob;
+              const url=URL.createObjectURL(blob);urlCache.set(r.id,{rev,url});byUrl.set(url,hasBuf?{buf:r.coverBuf,type:r.coverType,rev}:{blob,rev});o.cover=url;}
           }else if(old){URL.revokeObjectURL(old.url);byUrl.delete(old.url);urlCache.delete(r.id);}
           return o;};
         const cbs={};
@@ -408,6 +410,8 @@ textarea.short{min-height:80px}
     if(r.v==='shelf')renderShelf();else if(r.v==='book')renderBook(bookById(r.id));else renderBookForm(r.id?bookById(r.id):null,r.status);
   }
 
+  const isQuota=x=>!!x&&(x.name==='QuotaExceededError'||x.code===22||/quota/i.test(x.message||''));
+  const errText=x=>isQuota(x)?'พื้นที่เก็บข้อมูลของเบราว์เซอร์นี้เต็ม':'บันทึกไม่สำเร็จ'+(x&&x.name?' ('+x.name+')':'')+' ลองอีกครั้ง';
   // ---------- views ----------
   const STATUS=[['reading','กำลังอ่าน'],['toread','ยังไม่ได้อ่าน'],['done','อ่านจบแล้ว']];
   const statusLabel=k=>(STATUS.find(s=>s[0]===k)||STATUS[0])[1];
@@ -502,7 +506,7 @@ textarea.short{min-height:80px}
 
   async function saveBook(b,patch,msg){
     try{await store.save('books',b.id,{...strip(b),...patch});if(msg)toast(msg);return true;}
-    catch(x){toast('บันทึกไม่สำเร็จ ลองอีกครั้ง');return false;}
+    catch(x){toast(errText(x));return false;}
   }
 
   function renderBook(b){
@@ -575,7 +579,7 @@ textarea.short{min-height:80px}
         if(!b.status&&!patch.status)patch.status=statusOf(b);
         if(Object.keys(patch).length)await store.save('books',b.id,{...strip(b),...patch});
         freshId=id;editingEntryId=null;delete draft[b.id];render();toast(msg);
-      }catch(x){$('hint').textContent='บันทึกไม่สำเร็จ ลองอีกครั้ง';$('save').disabled=false;}
+      }catch(x){$('hint').textContent=errText(x);$('save').disabled=false;}
     };
 
     renderQuotes(b);
@@ -639,7 +643,7 @@ textarea.short{min-height:80px}
         if(b&&b.title!==title){for(const e of entriesOf(id)){await store.save('entries',e.id,{...strip(e),book:title});}}
         pendingCover=null;shelfTab=status;try{localStorage.setItem('rl-tab',status);}catch(e){}
         toast(b?'บันทึกการแก้ไขแล้ว':'เพิ่มหนังสือแล้ว');go('#/book/'+id);
-      }catch(x){$('hint').textContent=store.mode!=='db'?'บันทึกไม่สำเร็จ พื้นที่ในเบราว์เซอร์อาจเต็ม ลองเอารูปปกออก':'บันทึกไม่สำเร็จ ลองอีกครั้ง';$('save').disabled=false;}
+      }catch(x){$('hint').textContent=errText(x);$('save').disabled=false;}
     };
     if(b){
       const del=el('button','link danger','ลบเล่มนี้และบันทึกทั้งหมดของเล่มนี้');del.type='button';del.style.marginTop='6px';
@@ -754,7 +758,7 @@ textarea.short{min-height:80px}
       if(!text){$('qHint').textContent='พิมพ์ประโยคก่อนนะ';$('qText').focus();return;}
       $('qSave').disabled=true;
       try{await store.save('quotes',newId('q'),{bookId:b.id,text,page:num($('qPage').value),createdAt:Date.now()});$('qText').blur();render();toast('เก็บคำคมแล้ว');}
-      catch(x){$('qHint').textContent='เก็บไม่สำเร็จ ลองอีกครั้ง';$('qSave').disabled=false;}};
+      catch(x){$('qHint').textContent=errText(x);$('qSave').disabled=false;}};
   }
 
   // ---------- start ----------
@@ -762,7 +766,12 @@ textarea.short{min-height:80px}
     store=await dbStore();
     if(!store)store=await idbStore();
     if(!store)store=localStore();
-    if(store.mode!=='db'){const n=$('notice');n.hidden=false;n.textContent='บันทึกจะเก็บไว้ในเบราว์เซอร์นี้เท่านั้น ถ้าล้างข้อมูลเบราว์เซอร์ บันทึกจะหายไป';}
+    if(store.mode!=='db'){const n=$('notice');n.hidden=false;
+      if(store.mode==='idb'){n.textContent='บันทึกจะเก็บไว้ในเบราว์เซอร์นี้เท่านั้น ถ้าล้างข้อมูลเบราว์เซอร์ บันทึกจะหายไป';
+        try{if(navigator.storage&&navigator.storage.estimate){const est=await navigator.storage.estimate();
+          const mb=v=>(v/1048576).toLocaleString('th-TH',{maximumFractionDigits:1});
+          if(est&&est.quota)n.textContent+=' (ใช้ไป '+mb(est.usage||0)+' MB จากที่ใช้ได้ '+mb(est.quota)+' MB)';}}catch(e){}}
+      else n.textContent='เบราว์เซอร์นี้ไม่ยอมให้ใช้ที่เก็บข้อมูลขนาดใหญ่ (อาจเป็นโหมดส่วนตัว หรือเบราว์เซอร์ในแอพอย่าง LINE/Facebook) เลยเก็บได้แค่ราว 5 MB ลองเปิดด้วย Safari หรือ Chrome ตามปกติ';}
     const onErr=()=>toast('การเชื่อมต่อขาดหาย ลองโหลดหน้าใหม่');
     const onData=(name,list)=>{
       if(name==='books')books=list.filter(b=>b&&b.title);else if(name==='quotes')quotes=list.filter(q=>q&&q.text&&q.bookId);else entries=list.filter(e=>e&&e.date&&e.note);
